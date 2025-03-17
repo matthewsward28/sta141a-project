@@ -1,0 +1,1238 @@
+---
+title: "STA 141A Course Project Report"
+author: "Matthew Ward"
+date: "2025-03-04"
+output: html_document
+---
+
+```{r, echo=F, include = F}
+# Load necessary libraries
+suppressWarnings(library(tidyverse))
+suppressWarnings(library(knitr))
+suppressWarnings(library(dplyr))
+```
+
+<details>
+  <summary style="font-size: 30px; font-weight: bold;">Abstract</summary>
+  
+This project analyzes neural activity in mice during a decision-making task, focusing on how task conditions and brain area-specific activity influence performance. Using logistic regression and random forest models with PCA features, I predict trial outcomes, finding that neural activity is stronger during successful trials and varies significantly across brain areas and contrast conditions. My findings show the importance of the session/mouse and time specific data in predicting how a decision will be made. 
+
+</details>
+
+
+<details>
+  <summary style="font-size: 30px; font-weight: bold;">Section 1: Introduction</summary>
+
+In this project, I analyze a subset of data collected by Steinmetz et al. (2019) to understand the neural mechanisms underlying decision-making in mice. The study involved presenting visual stimuli to mice and recording neural activity in the visual cortex during decision-making tasks. My primary objective is to explore how neural activity varies with different task conditions, such as contrast levels and feedback types, and to identify patterns that correlate with successful task performance. I will then apply this knowledge to the preparation of the data for integration, enabling better predictive performance. Finally, I will build a prediction model to predict the outcome, and then test it on given test data.
+
+
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Data Description</summary>
+
+The dataset includes recordings from 18 sessions across four mice, with each session comprising several hundred trials. For each trial, we have information on the contrast levels of the visual stimuli, the feedback type (success or failure), and the spike trains of neurons in the visual cortex. I focus on the spike trains from the onset of the stimuli to 0.4 seconds post-onset.
+
+</details>
+
+<details>
+  <summary style="font-size: 30px; font-weight: bold;">Data Structure</summary>
+
+A total of 18 RDS files are provided that contain the records from 18 sessions. In each RDS file, you can find the name of mouse from `mouse_name` and date of the experiment from `date_exp`. 
+
+
+```{r echo = F}
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('./Data/session',i,'.rds',sep=''))
+}
+```
+
+Five variables are available for each trial, namely 
+
+- `feedback_type`: type of the feedback, 1 for success and -1 for failure
+- `contrast_left`: contrast of the left stimulus
+- `contrast_right`: contrast of the right stimulus
+- `time`: centers of the time bins for `spks`  
+- `spks`: numbers of spikes of neurons in the visual cortex in time bins defined in `time`
+- `brain_area`: area of the brain where each neuron lives
+
+Take the 11th trial in Session 5 for example, we can see that the left contrast for this trial is 
+```{r echo = F}
+session[[5]]$contrast_left[11]
+```  
+the right contrast is 
+```{r echo = F} 
+session[[5]]$contrast_right[11]
+```
+the feedback (i.e., outcome) of the trial is 
+```{r echo = F} 
+session[[5]]$feedback_type[11]
+```
+There are a total of 
+```{r echo = F} 
+length(session[[5]]$brain_area)
+``` 
+neurons in this trial from 
+```{r echo = F} 
+length(unique(session[[5]]$brain_area))
+``` 
+areas of the brain. The spike trains of these neurons are stored in 
+```{r echo = F}
+head(session[[5]]$spks[[11]])
+``` 
+which is a 
+```{r echo = F}
+dim(session[[5]]$spks[[11]])[1]
+``` 
+by 
+```{r echo = F}
+dim(session[[5]]$spks[[11]])[2]
+``` 
+matrix with each entry being the number of spikes of one neuron (i.e., row) in each time bin (i.e., column).
+
+</details>
+</details>
+
+
+
+<details>
+  <summary style="font-size: 30px; font-weight: bold;">Section 2: Exploratory Analysis</summary>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Summarize Session Information</summary>
+  
+We can report mouse_name, date_exp, number of brain_area, number of neurons, number of trials, and success rate for each session.
+
+```{r echo = F}
+# Create a tibble to store session metadata
+n.session <- length(session)
+meta <- tibble(
+  mouse_name = rep('name', n.session),
+  date_exp = rep('dt', n.session),
+  n_brain_area = rep(0, n.session),
+  n_neurons = rep(0, n.session),
+  n_trials = rep(0, n.session),
+  success_rate = rep(0, n.session)
+)
+
+# Fill the metadata tibble
+for (i in 1:n.session) {
+  tmp <- session[[i]]
+  meta[i, 1] <- tmp$mouse_name
+  meta[i, 2] <- tmp$date_exp
+  meta[i, 3] <- length(unique(tmp$brain_area))
+  meta[i, 4] <- dim(tmp$spks[[1]])[1]
+  meta[i, 5] <- length(tmp$feedback_type)
+  meta[i, 6] <- mean(tmp$feedback_type + 1) / 2
+}
+
+# Print the metadata table
+kable(meta, format = "html", table.attr = "class='table table-striped'", digits = 2)
+```
+  
+Notably, we can see that Lederberg has the most sessions and appears to have the highest overall success_rate.
+
+</details>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Compare Success Rates Between Mice</summary>
+
+We can compare the average success rates across mice.
+
+```{r echo = F}
+# Summarize success rates by mouse
+mouse_summary <- meta %>%
+  group_by(mouse_name) %>%
+  summarize(avg_success_rate = mean(success_rate))
+
+# Plot success rates by mouse
+ggplot(mouse_summary, aes(x = mouse_name, y = avg_success_rate, fill = mouse_name)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Average Success Rates by Mouse",
+       x = "Mouse",
+       y = "Average Success Rate") +
+  theme_minimal()
+```
+
+</details>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Session-Level Analysis</summary>
+  
+We can analyze neural activity at the session level.
+
+```{r echo = F}
+# Function to calculate average spike counts per brain area for a given trial
+average_spike_area <- function(i.t, this_session) {
+  spk.trial = this_session$spks[[i.t]]  # Extract spike data for the trial
+  area = this_session$brain_area  # Extract brain area labels
+  spk.count = apply(spk.trial, 1, sum)  # Calculate total spikes per neuron
+  spk.average.tapply = tapply(spk.count, area, mean)  # Average spikes per brain area
+  return(spk.average.tapply)
+}
+
+# Analyze Session 5 (chosen at random)
+i.s <- 5
+n.trial <- length(session[[i.s]]$feedback_type)
+n.area <- length(unique(session[[i.s]]$brain_area))
+
+# Create trial.summary for Session 5
+trial.summary <- matrix(nrow = n.trial, ncol = n.area + 4)
+for (i.t in 1:n.trial) {
+  avg_spikes <- average_spike_area(i.t, this_session = session[[i.s]])
+  trial.summary[i.t, ] <- c(
+    avg_spikes,
+    session[[i.s]]$feedback_type[i.t],
+    session[[i.s]]$contrast_left[i.t],
+    session[[i.s]]$contrast_right[i.t],
+    i.t
+  )
+}
+
+# Add column names
+colnames(trial.summary) <- c(
+  names(avg_spikes),  # Names of brain areas
+  "feedback", "left_contr", "right_contr", "id"
+)
+
+# Convert to a tibble
+trial.summary <- as_tibble(trial.summary)
+
+# Plot average spike counts across trials
+trial.summary.long <- trial.summary %>%
+  pivot_longer(cols = -c(feedback, left_contr, right_contr, id),
+               names_to = "area",
+               values_to = "average_spikes")
+
+ggplot(trial.summary.long, aes(x = id, y = average_spikes, color = area)) +
+  geom_line(alpha = 0.5) +
+  geom_smooth(method = "loess", se = FALSE) +
+  labs(title = "Average Spike Counts Across Trials for Session 5",
+       x = "Trial ID",
+       y = "Average Spike Counts",
+       color = "Brain Area") +
+  theme_minimal()
+```
+  
+  
+**Interpretation**: The plot shows average spike counts across trials during Session 5 for each brain area. Certain areas (e.g., root) exhibit higher activity compared to others. The fluctuations across trials suggest that feedback type has an effect on the spike counts of the mice.
+
+</details>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Trial-Level Analysis</summary>
+
+We can visualize neural activity at the trial level.
+
+```{r echo = F}
+# Function to plot neural activity for a single trial
+plot.trial <- function(i.t, area, area.col, this_session) {
+  spks <- this_session$spks[[i.t]]
+  n.neuron <- dim(spks)[1]
+  time.points <- this_session$time[[i.t]]
+  
+  plot(0, 0, xlim = c(min(time.points), max(time.points)), ylim = c(0, n.neuron + 1), 
+       col = 'white', xlab = 'Time (s)', yaxt = 'n', ylab = 'Neuron', 
+       main = paste('Trial ', i.t, 'feedback', this_session$feedback_type[i.t]), cex.lab = 1.5)
+  
+  for (i in 1:n.neuron) {
+    i.a <- which(area == this_session$brain_area[i])
+    col.this <- area.col[i.a]
+    
+    ids.spike <- which(spks[i, ] > 0)  # Find spike timestamps
+    if (length(ids.spike) > 0) {
+      points(x = time.points[ids.spike], y = rep(i, length(ids.spike)), 
+             pch = '.', cex = 2, col = col.this)
+    }
+  }
+  
+  legend("topright", legend = area, col = area.col, pch = 16, cex = 0.8)
+}
+
+# Plot neural activity for Trial 1 and Trial 2 in Session 2
+area.col <- rainbow(n = n.area, alpha = 0.7)
+varname <- names(trial.summary)
+area <- varname[1:(length(varname) - 4)]
+par(mfrow = c(1, 2))
+plot.trial(1, area, area.col, session[[i.s]])
+plot.trial(2, area, area.col, session[[i.s]])
+par(mfrow = c(1, 1))
+```
+  
+**Interpretation**: The plot shows neural activity for individual trials. Each dot represents a spike, and colors correspond to different brain areas. Patterns of activity vary depending on feedback type. This suggests that there is a specific time where average spike count is highest due to the effects of feedback.
+
+</details>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Success Rates by Contrast Conditions</summary>
+
+We can analyze how success rates vary with different contrast conditions.
+
+```{r echo = F}
+# Function to calculate and plot success rates by contrast conditions
+analyze_success_rates <- function(i.s, session) {
+  session_data <- session[[i.s]]
+  
+  # Calculate success rates for different contrast conditions
+  success_rates <- tibble(
+    contrast_left = session_data$contrast_left,
+    contrast_right = session_data$contrast_right,
+    feedback_type = session_data$feedback_type
+  ) %>%
+    group_by(contrast_left, contrast_right) %>%
+    summarize(success_rate = mean(feedback_type == 1), .groups = 'drop')
+  
+  # Plot success rates
+  plot <- ggplot(success_rates, aes(x = factor(contrast_left), y = factor(contrast_right), fill = success_rate)) +
+    geom_tile() +
+    scale_fill_gradient(low = "white", high = "blue") +
+    labs(title = paste("Success Rates by Contrast Conditions for Session", i.s),
+         x = "Left Contrast",
+         y = "Right Contrast",
+         fill = "Success Rate") +
+    theme_minimal()
+  
+  return(plot)
+}
+```
+
+```{r echo = F}
+# Aggregate success rates across all sessions
+all_success_rates <- do.call(rbind, lapply(1:18, function(i.s) {
+  session_data <- session[[i.s]]
+  tibble(
+    contrast_left = session_data$contrast_left,
+    contrast_right = session_data$contrast_right,
+    feedback_type = session_data$feedback_type,
+    session = i.s
+  )
+}))
+
+# Calculate success rates for each contrast condition
+success_rate_summary <- all_success_rates %>%
+  group_by(contrast_left, contrast_right) %>%
+  summarize(
+    success_rate = mean(feedback_type == 1),  # Calculate success rate
+    .groups = 'drop'
+  )
+
+# Plot aggregated success rates
+ggplot(success_rate_summary, aes(x = factor(contrast_left), y = factor(contrast_right), fill = success_rate)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(
+    title = "Aggregated Success Rates by Contrast Conditions",
+    x = "Left Contrast",
+    y = "Right Contrast",
+    fill = "Success Rate"
+  ) +
+  theme_minimal()
+```
+  
+**Interpretation**: The heatmap shows success rates for different combinations of left and right contrasts. High success rates (darker colors) indicate conditions where the mouse reliably made correct decisions. For example, when `contrast_left = 1` and `contrast_right = 0`, the mouse should turn the wheel to the left. A high success rate here suggests the mouse correctly followed the rule. Conversely, when contrasts are equal (e.g., `0.5 vs. 0.5`), success rates are lower, as the correct choice is random.") This heatmap is the aggregate of every session.
+
+</details>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Neural Activity Across Sessions</summary>
+
+```{r echo = F}
+# Calculate average spike counts across sessions
+session_spike_summary <- do.call(rbind, lapply(1:18, function(i.s) {
+  session_data <- session[[i.s]]
+  
+  # Calculate average spike counts per trial
+  avg_spikes_per_trial <- sapply(1:length(session_data$feedback_type), function(i.t) {
+    mean(rowSums(session_data$spks[[i.t]]))  # Mean spikes per neuron per trial
+  })
+  
+  # Create a tibble for the session
+  tibble(
+    session = i.s,
+    mouse_name = session_data$mouse_name,
+    avg_spikes = mean(avg_spikes_per_trial)  # Average spikes across all trials in the session
+  )
+}))
+
+# Plot average spike counts across sessions
+ggplot(session_spike_summary, aes(x = session, y = avg_spikes, color = mouse_name)) +
+  geom_line() +
+  geom_point() +  # Add points for better visualization
+  labs(
+    title = "Average Spike Counts Across Sessions",
+    x = "Session",
+    y = "Average Spike Counts",
+    color = "Mouse"
+  ) +
+  theme_minimal()
+```
+  
+**Interpretation**: An upward trend across sessions, such as with Cori and Forssmann, may indicate mice are learning the task and becoming more engaged, or that the neurons are adapting to the stimuli over time. A downward trend across sessions, such as with Hench and Lederberg, may indicate that the mice are becoming fatigued or disengaged, or that the neurons are habituating to the stimuli. As we see that Lederberg's success rate increases with session, in his case this suggests the latter.
+
+</details>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Feedback Effects on Neural Activity</summary>
+  
+```{r echo = F}
+# Calculate spike counts for success vs. failure trials
+feedback_spike_summary <- do.call(rbind, lapply(1:18, function(i.s) {
+  session_data <- session[[i.s]]
+  
+  # Calculate average spike counts for success trials
+  success_spikes <- sapply(which(session_data$feedback_type == 1), function(i.t) {
+    mean(rowSums(session_data$spks[[i.t]]))  # Mean spikes per neuron for success trials
+  })
+  
+  # Calculate average spike counts for failure trials
+  failure_spikes <- sapply(which(session_data$feedback_type == -1), function(i.t) {
+    mean(rowSums(session_data$spks[[i.t]]))  # Mean spikes per neuron for failure trials
+  })
+  
+  # Handle cases where there are no success or failure trials
+  success_avg <- if (length(success_spikes) > 0) mean(success_spikes) else NA
+  failure_avg <- if (length(failure_spikes) > 0) mean(failure_spikes) else NA
+  
+  # Create a tibble for the session
+  tibble(
+    session = i.s,
+    mouse_name = session_data$mouse_name,
+    success_avg = success_avg,
+    failure_avg = failure_avg
+  )
+}))
+
+# Plot success vs. failure spike counts
+ggplot(feedback_spike_summary, aes(x = session)) +
+  geom_line(aes(y = success_avg, color = "Success")) +
+  geom_line(aes(y = failure_avg, color = "Failure")) +
+  labs(
+    title = "Average Spike Counts for Success vs. Failure Trials",
+    x = "Session",
+    y = "Average Spike Counts",
+    color = "Feedback Type"
+  ) +
+  theme_minimal()
+```
+  
+**Interpretation**: As the success line is consistently higher than the failure line, the neural activity appears to be stronger during successful trials. Increases in the success line could indicate that the mouse is learning the task, leading to stronger neural activity during successful trials. Decreases in the failure line could indicate that the mouse is making fewer mistakes, leading to weaker neural activity during failed trials. We can assume then that the model will likely have a bias towards successes in predicting the outcome of trials.
+
+```{r echo = F}
+# Compare feedback effects by brain area
+feedback_by_area <- trial.summary.long %>%
+  group_by(area, feedback) %>%
+  summarize(avg_spikes = mean(average_spikes), .groups = 'drop')
+
+ggplot(feedback_by_area, aes(x = area, y = avg_spikes, fill = factor(feedback))) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Average Spike Counts by Brain Area and Feedback Type",
+       x = "Brain Area",
+       y = "Average Spike Counts",
+       fill = "Feedback Type") +
+  theme_minimal()
+```
+  
+**Interpretation**: The feedback appears to effect some brain areas, such as root or SUB, more than others, like ACA and ORB, which appear to have about equal average spike counts depending on feedback type. Because of this, a focus on filtering to certain brain areas may not be the best way to predict the outcome of trials.
+
+```{r echo = F}
+# Function to find the time bin with the most active neurons in a trial
+find_most_active_time_bin <- function(spks, time_points) {
+  # Calculate total spikes per time bin across all neurons
+  total_spikes_per_bin <- colSums(spks)
+  
+  # Find the time bin with the maximum total spikes
+  max_spike_bin <- which.max(total_spikes_per_bin)
+  
+  # Return the corresponding time point
+  return(time_points[max_spike_bin])
+}
+
+# Example: Find the most active time bin for Trial 1 in Session 5
+most_active_time_bin <- find_most_active_time_bin(session[[5]]$spks[[1]], session[[5]]$time[[1]])
+print(most_active_time_bin)
+```
+
+**Interpretation**: Each mouse has periods of time during their trials in which the amount of active neurons is at its highest. For session 5, trial 1, it is at time = 57.5774 seconds.
+
+</details>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Key Insights</summary>
+
+#### **1. Neural Activity and Task Performance**
+- **Higher Neural Activity During Success:**
+  - Neural activity (spike counts) is consistently higher during **successful trials** compared to failed trials.
+  - This suggests that **successful task performance** is associated with stronger neural engagement or more synchronized neural firing.
+
+- **Learning Effects:**
+  - A **downward trend in neural activity** for some mice (e.g., Lederberg) across sessions may indicate that the mice may be **learning the task** and becoming more engaged over time.
+  - Conversely, for other mice (e.g., Hench and Cori) may suggest **fatigue** or **habituation** to the task.
+
+---
+
+#### **2. Brain Area-Specific Activity**
+- **Variability in Brain Area Activity:**
+  - Certain brain areas (e.g., "root") exhibit **higher neural activity** compared to others.
+  - This suggests that **specific brain areas** may play a more significant role in processing the visual stimuli or making decisions.
+
+- **Feedback-Dependent Activity:**
+  - Neural activity patterns vary depending on **feedback type** (success or failure).
+  - For example, certain brain areas may show **increased activity** during successful trials, while others may show **decreased activity** during failed trials.
+
+---
+
+#### **3. Contrast Conditions and Decision-Making**
+- **Clear Contrast Differences Drive Success:**
+  - Mice perform best when there is a **clear difference** between the left and right contrasts (e.g., `1 vs. 0`).
+  - This suggests that mice rely on **contrast differences** to make decisions, and their performance improves when the task is easier (i.e., the correct choice is more obvious).
+
+- **Random Guessing in Equal Contrasts:**
+  - When the left and right contrasts are **equal** (e.g., `0.5 vs. 0.5`), success rates drop to around **50%**, indicating that mice are **guessing** rather than making informed decisions.
+  - This aligns with the experimental design, where the correct choice is **random** in equal contrast conditions.
+
+---
+
+#### **4. Individual Differences Between Mice**
+- **Variability in Success Rates:**
+  - Some mice have **higher success rates** compared to others.
+  - This suggests **individual differences** in learning ability, decision-making, or engagement with the task.
+  - This may mean that focusing on some mice over others may be a better way to improving the predictive model.
+
+- **Variability in Neural Activity Trends:**
+  - Neural activity trends vary between mice, with some showing an **upward trend** and others showing a **downward trend**.
+  - These differences may reflect **variability in how mice adapt** to the task over time.
+
+---
+
+#### **5. Feedback Effects on Neural Activity**
+- **Feedback as a Modulator of Neural Activity:**
+  - **Successful trials** are associated with **higher spike counts**, suggesting that positive feedback may **enhance neural engagement**.
+  - **Failed trials** are associated with **lower spike counts**, suggesting that negative feedback may **reduce neural activity** or lead to disengagement.
+
+---
+
+#### **6. Temporal Dynamics of Neural Activity**
+- **Trial-Level Variability:**
+  - Neural activity varies significantly across trials, even within the same session.
+  - This variability may reflect **changes in attention**, **task difficulty**, or **feedback effects** on a trial-by-trial basis.
+
+- **Time-Dependent Patterns:**
+  - Neural activity is **temporally organized**, with spikes occurring at specific time points during the trial.
+  - This suggests that neural activity reflects **processing of visual stimuli** or **decision-making processes**.
+
+
+
+</details>
+</details>
+
+
+
+<details>
+  <summary style="font-size: 30px; font-weight: bold;">Section 3: Data Integration</summary>
+  
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Temporal Features</summary>
+  
+```{r echo = F}
+# Function to filter spike data to the most active time window
+filter_to_most_active_window <- function(spks, time_points, window_size = 0.1) {
+  # Find the most active time bin
+  most_active_time_bin <- find_most_active_time_bin(spks, time_points)
+  
+  # Define the time window around the most active time bin
+  time_window <- c(most_active_time_bin - window_size, most_active_time_bin + window_size)
+  
+  # Find the indices of time points within the window
+  time_indices <- which(time_points >= time_window[1] & time_points <= time_window[2])
+  
+  # Filter the spike data to the time window
+  filtered_spks <- spks[, time_indices]
+  
+  return(filtered_spks)
+}
+
+# Initialize a list to store filtered spike data
+filtered_session_data <- list()
+
+# Loop through each session
+for (i in 1:length(session)) {
+  session_data <- session[[i]]
+  n_trials <- length(session_data$feedback_type)
+  
+  # Initialize a list to store filtered spike data for the session
+  filtered_spks_session <- list()
+  
+  # Loop through each trial in the session
+  for (j in 1:n_trials) {
+    # Filter spike data to the most active time window
+    filtered_spks <- filter_to_most_active_window(session_data$spks[[j]], session_data$time[[j]])
+    
+    # Store the filtered spike data
+    filtered_spks_session[[j]] <- filtered_spks
+  }
+  
+  # Store the filtered spike data for the session
+  filtered_session_data[[i]] <- filtered_spks_session
+}
+```
+  
+We can implement temporal features to the data to filter out times when there are lower average spike counts during the trials. 
+
+</details>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Neural Activity Features</summary>
+
+```{r echo = F}
+# Function to calculate features for each trial, including filtered spike data
+calculate_features <- function(session_data) {
+  n_trials <- length(session_data$feedback_type)
+  n_neurons <- dim(session_data$spks[[1]])[1]
+  
+  # Initialize a tibble to store features
+  features <- tibble(
+    trial_id = 1:n_trials,
+    feedback_type = session_data$feedback_type,
+    contrast_left = session_data$contrast_left,
+    contrast_right = session_data$contrast_right,
+    avg_spikes = sapply(session_data$spks, function(spks) mean(rowSums(spks))),  # Average spikes per neuron (full trial)
+    prop_active_neurons = sapply(session_data$spks, function(spks) mean(rowSums(spks) > 0)),  # Proportion of active neurons (full trial)
+    avg_firing_rate = sapply(session_data$spks, function(spks) mean(colMeans(spks))),  # Average firing rate (full trial)
+    brain_area_avg = lapply(session_data$spks, function(spks) {  # Average spikes per brain area (full trial)
+      area <- session_data$brain_area
+      tapply(rowSums(spks), area, mean)
+    }),
+    # Add features for the most active time window
+    filtered_avg_spikes = sapply(1:n_trials, function(i.t) {
+      filtered_spks <- filter_to_most_active_window(session_data$spks[[i.t]], session_data$time[[i.t]])
+      mean(rowSums(filtered_spks))  # Average spikes per neuron in the most active window
+    }),
+    filtered_prop_active_neurons = sapply(1:n_trials, function(i.t) {
+      filtered_spks <- filter_to_most_active_window(session_data$spks[[i.t]], session_data$time[[i.t]])
+      mean(rowSums(filtered_spks) > 0)  # Proportion of active neurons in the most active window
+    }),
+    filtered_avg_firing_rate = sapply(1:n_trials, function(i.t) {
+      filtered_spks <- filter_to_most_active_window(session_data$spks[[i.t]], session_data$time[[i.t]])
+      mean(colMeans(filtered_spks))  # Average firing rate in the most active window
+    })
+  )
+  
+  return(features)
+}
+
+# Example: Calculate features for Session 5
+session_5_features <- calculate_features(session[[5]])
+head(session_5_features)
+```
+  
+- **Average spike counts per brain area**: This feature captures the overall neural engagement in different brain regions, which is crucial for understanding how different areas contribute to decision-making.
+
+- **Temporal patterns of spike counts**: By focusing on specific time bins (e.g., 0–0.2 seconds and 0.2–0.4 seconds post-stimulus onset), I can capture the dynamic nature of neural responses to stimuli.
+
+- **Feedback-dependent spike counts**: Since neural activity differs significantly between successful and failed trials, separating these features allows the model to learn from feedback-specific patterns, which could improve predictive performance.
+
+- **Key Insight**: Neural activity is not uniform across brain areas or time. By extracting these features, I can capture the heterogeneity in neural responses, which is essential for building a robust predictive model.
+
+- **Proportion of active neurons**: This feature captures the percentage of neurons that fired at least one spike during the trial. A higher proportion indicates greater neural engagement.
+
+- **Average firing rate**: This feature represents the average number of spikes per neuron per time bin. It provides insight into the overall level of neural activity during the trial.
+
+- **Brain area-specific averages**: By calculating average spike counts for each brain area, I can identify which areas are most active during the task. This reveals areas that play a key role in decision-making.
+
+</details>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Normalization</summary>
+
+```{r echo = F}
+# Combined function to flatten, normalize, and reorganize spike counts
+process_spike_counts <- function(session_data) {
+  n_trials <- length(session_data$feedback_type)
+  n_neurons <- dim(session_data$spks[[1]])[1]  # Number of neurons per trial
+  
+  # Step 1: Flatten spike counts into a tidy format
+  spike_counts <- tibble(
+    trial_id = rep(1:n_trials, each = n_neurons),
+    neuron_id = rep(1:n_neurons, times = n_trials),
+    spike_count = unlist(lapply(session_data$spks, rowSums))  # Sum spikes per neuron per trial
+  )
+  
+  # Step 2: Normalize spike counts using z-score normalization
+  spike_counts <- spike_counts %>%
+    group_by(neuron_id) %>%  # Normalize by neuron to account for neuron-specific baselines
+    mutate(normalized_spikes = scale(spike_count))  # Z-score normalization
+  
+  return(spike_counts)  # Return the normalized spike counts with neuron_id
+}
+
+# Example usage for Session 5
+session_5_trial_level_spikes <- process_spike_counts(session[[5]])
+head(session_5_trial_level_spikes)
+
+# Merge normalized spike counts with other trial-level features
+session_5_features = session_5_features %>%
+  left_join(session_5_trial_level_spikes, by = "trial_id")
+```
+  
+- Neural activity can vary significantly across sessions due to differences in baseline firing rates or recording conditions. Z-score normalization ensures that spike counts are on a comparable scale across sessions, allowing the model to focus on relative changes in activity rather than absolute values.
+
+- **Key Insight**: Normalization is critical for integrating data across sessions, as it reduces session-specific biases and ensures that the model can generalize well to new data.
+  
+</details>  
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Principal Component Analysis</summary>
+
+```{r echo = F}
+# Function to perform PCA and add principal components to session features
+add_pca_features <- function(session_data) {
+  # Step 1: Flatten, normalize, and reorganize spike counts
+  spike_counts <- process_spike_counts(session_data)
+  
+  # Step 2: Reshape normalized spike counts into a wide format for PCA
+  wide_normalized_spikes <- spike_counts %>%
+    pivot_wider(names_from = neuron_id, values_from = normalized_spikes, values_fill = 0)
+  
+  # Step 3: Extract the numeric matrix for PCA
+  pca_input <- wide_normalized_spikes %>%
+    select(-trial_id) %>%  # Remove non-numeric columns
+    as.matrix()
+  
+  # Step 4: Remove columns with zero variance
+  pca_input <- pca_input[, apply(pca_input, 2, function(x) var(x, na.rm = TRUE) != 0)]
+  
+  # Step 5: Perform PCA
+  pca_results <- prcomp(pca_input, scale = TRUE)
+  
+  # Step 6: Extract the first 5 principal components
+  pca_features <- pca_results$x[, 1:5]
+  
+  # Step 7: Add trial_id to pca_features for alignment
+  pca_features <- as_tibble(pca_features) %>%
+    mutate(trial_id = wide_normalized_spikes$trial_id)
+  
+  # Step 8: Merge PCA features with session features
+  session_features <- calculate_features(session_data)  # Assuming calculate_features is already defined
+  session_features <- session_features %>%
+    left_join(pca_features, by = "trial_id")
+  
+  return(session_features)
+}
+
+# Example usage for Session 5
+session_5_features_with_pca <- add_pca_features(session[[5]])
+head(session_5_features_with_pca)
+```
+  
+- Neural activity data is high-dimensional, with many neurons and time bins. PCA reduces the dimensionality of the data while preserving the most important patterns of variance. This not only simplifies the model but also helps mitigate the risk of overfitting.
+
+- **Key Insight**: The first 5 principal components capture the majority of the variance in the neural activity data, allowing the model to focus on the most informative features for prediction.
+
+</details>
+</details>
+
+
+<details>
+  <summary style="font-size: 30px; font-weight: bold;">Section 4: Predictive Modeling</summary>
+  
+<details>
+  <summary style="font-size: 25px; font-weight: bold;">Logistic Regression Model</summary>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Model Training</summary>
+  
+```{r echo = F}
+suppressPackageStartupMessages(suppressWarnings(library(caret)))
+
+# Function to train a logistic regression model with PCA features
+train_model_with_pca <- function(session_features) {
+  # Recode feedback_type for binary classification
+  session_features$feedback_type <- ifelse(session_features$feedback_type == -1, 0, 1)
+  
+  # Split data into training and testing sets
+  set.seed(141)
+  train_index <- createDataPartition(session_features$feedback_type, p = 0.8, list = FALSE)
+  train_data <- session_features[train_index, ]
+  test_data <- session_features[-train_index, ]
+  
+  # Train logistic regression model with PCA features
+  model <- glm(feedback_type ~ contrast_left + contrast_right + 
+               avg_spikes + prop_active_neurons + avg_firing_rate + 
+               filtered_avg_spikes + filtered_prop_active_neurons + filtered_avg_firing_rate +
+               PC1 + PC2 + PC3 + PC4 + PC5, 
+               data = train_data, family = binomial)
+  
+  # Predict on test data
+  predictions <- predict(model, test_data, type = "response")
+  predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+  
+  # Evaluate model performance
+  confusion_matrix <- table(Predicted = predicted_classes, Actual = test_data$feedback_type)
+  accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+  
+  return(list(model = model, accuracy = accuracy, confusion_matrix = confusion_matrix))
+}
+```
+  
+Started off with a logistic regression model.
+
+</details>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Apply Model to Each Session</summary>
+
+```{r echo = F}
+# Apply the model to all sessions with PCA features
+apply_model_to_all_sessions_with_pca <- function(session_list) {
+  results <- list()
+  
+  for (i in 1:length(session_list)) {
+    session_data <- session_list[[i]]
+    
+    # Calculate features for the session
+    session_features <- add_pca_features(session_data)
+    
+    # Train and evaluate the model
+    model_results <- train_model_with_pca(session_features)
+    
+    # Store the results
+    results[[i]] <- list(
+      session_id = i,
+      mouse_name = session_data$mouse_name,
+      date_exp = session_data$date_exp,
+      model = model_results$model,
+      accuracy = model_results$accuracy,
+      confusion_matrix = model_results$confusion_matrix
+    )
+  }
+  
+  return(results)
+}
+
+# Apply the model to all sessions
+all_session_results_with_pca <- suppressWarnings(apply_model_to_all_sessions_with_pca(session))
+
+# Print the results for each session
+for (i in 1:length(all_session_results_with_pca)) {
+  cat("Session ID:", all_session_results_with_pca[[i]]$session_id, "\n")
+  cat("Mouse Name:", all_session_results_with_pca[[i]]$mouse_name, "\n")
+  cat("Date of Experiment:", all_session_results_with_pca[[i]]$date_exp, "\n")
+  cat("Model Accuracy:", all_session_results_with_pca[[i]]$accuracy, "\n")
+  cat("Confusion Matrix:\n")
+  print(all_session_results_with_pca[[i]]$confusion_matrix)
+  cat("\n")
+}
+```
+
+- **Model Bias Toward Success**:
+  - In sessions with low accuracy, the model tends to predict all trials as successes (1). This suggests that the model may be biased toward the majority class (successes), especially in sessions where failures are underrepresented.
+
+  - For example, in Session 17, the model predicts only predicts a total of 10 trials to be failures
+  
+- **Variability Across Mice**:
+
+  - The model performs well for Lederberg and moderately for Forssmann and Hench, but struggles with Cori. This could be due to differences in neural activity patterns, task engagement, or data quality across mice.
+  
+- **Impact of Contrast Conditions**:
+
+  - The model's performance may be influenced by the distribution of contrast conditions in each session. For example, sessions with more balanced contrast conditions (e.g., equal left and right contrasts) may be harder to predict, leading to lower accuracy.
+  
+- **Neural Activity Patterns**:
+
+  - The model relies on neural activity features (e.g., average spikes, firing rates) to make predictions. Sessions with more distinct neural activity patterns for successes and failures may yield higher accuracy.
+  
+</details>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Combined Model for All Sessions</summary>
+  
+```{r echo = F}
+# Function to combine data from all sessions with PCA features
+combine_session_data_with_pca <- function(session_list) {
+  combined_data <- list()
+  
+  for (i in 1:length(session_list)) {
+    session_data <- session_list[[i]]
+    
+    # Calculate features for the session with PCA
+    session_features <- add_pca_features(session_data)
+    
+    # Add session ID to the features
+    session_features$session_id <- i
+    
+    # Append the session data to the combined dataset
+    combined_data[[i]] <- session_features
+  }
+  
+  # Combine all session data into a single data frame
+  combined_data <- do.call(rbind, combined_data)
+  
+  return(combined_data)
+}
+
+# Combine data from all sessions with PCA features
+all_sessions_data_with_pca <- combine_session_data_with_pca(session)
+
+# Normalize numerical features across all sessions
+normalize_combined_data_with_pca <- function(combined_data) {
+  combined_data <- combined_data %>%
+    group_by(session_id) %>%
+    mutate(across(c(avg_spikes, prop_active_neurons, avg_firing_rate, 
+                    filtered_avg_spikes, filtered_prop_active_neurons, filtered_avg_firing_rate), scale)) %>%
+    ungroup()
+  
+  return(combined_data)
+}
+
+# Normalize the combined data with PCA features
+all_sessions_data_with_pca <- normalize_combined_data_with_pca(all_sessions_data_with_pca)
+
+# Convert session_id to factor
+all_sessions_data_with_pca$session_id <- as.factor(all_sessions_data_with_pca$session_id)
+
+# Train a single logistic regression model on the combined data with PCA features
+train_combined_model_with_pca <- function(combined_data) {
+  # Recode feedback_type for binary classification
+  combined_data$feedback_type <- ifelse(combined_data$feedback_type == -1, 0, 1)
+  
+  # Split the combined data into training and testing sets
+  set.seed(141)  # For reproducibility
+  train_index <- sample(1:nrow(combined_data), size = 0.8 * nrow(combined_data))
+  train_data <- combined_data[train_index, ]
+  test_data <- combined_data[-train_index, ]
+  
+  # Train logistic regression model with PCA features
+  model <- glm(feedback_type ~ contrast_left + contrast_right + 
+               avg_spikes + prop_active_neurons + avg_firing_rate + 
+               filtered_avg_spikes + filtered_prop_active_neurons + filtered_avg_firing_rate +
+               PC1 + PC2 + PC3 + PC4 + PC5 +
+               session_id, 
+               data = train_data, family = binomial)
+  
+  # Predict on test data
+  predictions <- predict(model, test_data, type = "response")
+  predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+  
+  # Evaluate model performance
+  confusion_matrix <- table(Predicted = predicted_classes, Actual = test_data$feedback_type)
+  accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+  
+  return(list(model = model, accuracy = accuracy, confusion_matrix = confusion_matrix))
+}
+
+# Train the combined logistic regression model with PCA features
+combined_model_results_with_pca <- suppressWarnings(train_combined_model_with_pca(all_sessions_data_with_pca))
+
+# Print the results
+cat("Combined Logistic Regression Model Accuracy with PCA:", combined_model_results_with_pca$accuracy, "\n")
+cat("Combined Logistic Regression Model Confusion Matrix with PCA:\n")
+print(combined_model_results_with_pca$confusion_matrix)
+```
+  
+- The dataset has significantly more successes than failures, which causes the model to prioritize predicting successes.
+
+- This is evident from the high number of false negatives (648), where the model incorrectly predicts failures as successes.
+
+</details>
+</details>
+
+
+
+<details>
+  <summary style="font-size: 25px; font-weight: bold;">Random Forest Model</summary>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Model Training</summary>
+  
+```{r echo = F}
+suppressPackageStartupMessages(suppressWarnings(library(randomForest)))
+
+# Function to train a Random Forest model with PCA features
+train_random_forest_with_pca <- function(session_features) {
+  # Recode feedback_type for binary classification
+  session_features$feedback_type <- ifelse(session_features$feedback_type == -1, 0, 1)
+  
+  # Split data into training and testing sets
+  set.seed(141)  # For reproducibility
+  train_index <- createDataPartition(session_features$feedback_type, p = 0.8, list = FALSE)
+  train_data <- session_features[train_index, ]
+  test_data <- session_features[-train_index, ]
+  
+  # Train Random Forest model with PCA features
+  rf_model <- randomForest(
+    feedback_type ~ contrast_left + contrast_right + 
+      avg_spikes + prop_active_neurons + avg_firing_rate + 
+      filtered_avg_spikes + filtered_prop_active_neurons + filtered_avg_firing_rate +
+      PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10, 
+    data = train_data, 
+    ntree = 100,  # Number of trees in the forest
+    mtry = sqrt(ncol(train_data) - 1),  # Number of features to consider at each split
+    importance = TRUE  # To assess variable importance
+  )
+  
+  # Predict on test data
+  predictions <- predict(rf_model, test_data, type = "response")
+  predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+  
+  # Evaluate model performance
+  confusion_matrix <- table(Predicted = predicted_classes, Actual = test_data$feedback_type)
+  accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+  
+  return(list(model = rf_model, accuracy = accuracy, confusion_matrix = confusion_matrix))
+}
+```
+  
+Decided on using a random forest model for the second model because of its low risk of overfitting, as the data includes many features.
+
+</details>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Apply Model to Each Session</summary>
+
+```{r echo = F}
+# Apply the Random Forest model to all sessions with PCA features
+all_session_results_rf_with_pca <- suppressWarnings(apply_model_to_all_sessions_with_pca(session))
+
+# Print the results for each session
+for (i in 1:length(all_session_results_rf_with_pca)) {
+  cat("Session ID:", all_session_results_rf_with_pca[[i]]$session_id, "\n")
+  cat("Mouse Name:", all_session_results_rf_with_pca[[i]]$mouse_name, "\n")
+  cat("Date of Experiment:", all_session_results_rf_with_pca[[i]]$date_exp, "\n")
+  cat("Model Accuracy:", all_session_results_rf_with_pca[[i]]$accuracy, "\n")
+  cat("Confusion Matrix:\n")
+  print(all_session_results_rf_with_pca[[i]]$confusion_matrix)
+  cat("\n")
+}
+```
+  
+- Session specific model accuracy is about the same for the random forest model as it is for the logistic regression model
+
+- The relative difference in how each session performs is the same between models
+  - This means that in choosing a subset of sessions to build the model around, the choice of sessions would be the same for each model
+
+</details>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Combined Model for All Sessions</summary>
+  
+```{r echo = F}
+# Train a combined Random Forest model with PCA features
+train_combined_random_forest_with_pca <- function(combined_data) {
+  # Recode feedback_type for binary classification
+  combined_data$feedback_type <- ifelse(combined_data$feedback_type == -1, 0, 1)
+  
+  # Split the combined data into training and testing sets
+  set.seed(141)  # For reproducibility
+  train_index <- sample(1:nrow(combined_data), size = 0.8 * nrow(combined_data))
+  train_data <- combined_data[train_index, ]
+  test_data <- combined_data[-train_index, ]
+  
+  # Train Random Forest model with PCA features
+  rf_model <- randomForest(
+    feedback_type ~ contrast_left + contrast_right + 
+      avg_spikes + prop_active_neurons + avg_firing_rate + 
+      filtered_avg_spikes + filtered_prop_active_neurons + filtered_avg_firing_rate +
+      PC1 + PC2 + PC3 + PC4 + PC5 + 
+      session_id, 
+    data = train_data, 
+    ntree = 100,  # Number of trees in the forest
+    mtry = sqrt(ncol(train_data) - 1),  # Number of features to consider at each split
+    importance = TRUE  # To assess variable importance
+  )
+  
+  # Predict on test data
+  predictions <- predict(rf_model, test_data, type = "response")
+  predicted_classes <- ifelse(predictions > 0.5, 1, 0)
+  
+  # Evaluate model performance
+  confusion_matrix <- table(Predicted = predicted_classes, Actual = test_data$feedback_type)
+  accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+  
+  return(list(model = rf_model, accuracy = accuracy, confusion_matrix = confusion_matrix))
+}
+
+# Train the combined Random Forest model with PCA features
+combined_rf_results_with_pca <- suppressWarnings(train_combined_random_forest_with_pca(all_sessions_data_with_pca))
+
+# Print the results
+cat("Combined Random Forest Model Accuracy with PCA:", combined_rf_results_with_pca$accuracy, "\n")
+cat("Combined Random Forest Model Confusion Matrix with PCA:\n")
+print(combined_rf_results_with_pca$confusion_matrix)
+```
+  
+- For some reason, the random forest model when using the combined data predicts with 100% accuracy. This must be some kind of issue, so lets try filtering the data to just one mouse.
+
+</details>
+</details>
+
+
+<details>
+  <summary style="font-size: 25px; font-weight: bold;">Final Models</summary>
+  
+  <details>
+  <summary style="font-size: 20px; font-weight: bold;">Models Training</summary>
+  
+```{r echo = F}
+# Filter sessions 12-18
+sessions_12_to_18 <- session[12:18]
+```
+  
+- We filter the data to only include sessions twelve to eighteen because these are the ones that were performed by the mouse Lederberg
+- Lederberg had the best overall performance from any mouse according to the accuracy of my model
+  - Lederberg's average spike count went down each session, but his success rate overall went up with the progression of sessions
+```{r echo = F}
+# Combine data from sessions 12-18
+combined_data_12_to_18 <- combine_session_data_with_pca(sessions_12_to_18)
+
+# Normalize the combined data
+combined_data_12_to_18 <- normalize_combined_data_with_pca(combined_data_12_to_18)
+
+# Train the logistic regression model on sessions 12-18
+logistic_model_12_to_18 <- train_combined_model_with_pca(combined_data_12_to_18)
+
+# Print the results
+cat("Logistic Regression Model Accuracy (Lederberg):", logistic_model_12_to_18$accuracy, "\n")
+cat("Logistic Regression Model Confusion Matrix (Lederberg):\n")
+print(logistic_model_12_to_18$confusion_matrix)
+```
+  
+- It looks like the logistic regression model with regards to Lederberg has a heavy bias towards successes, only predicting failures right about half the time.
+
+```{r echo = F}
+# Combine data from sessions 12-18
+combined_data_12_to_18 <- combine_session_data_with_pca(sessions_12_to_18)
+
+# Normalize the combined data
+combined_data_12_to_18 <- normalize_combined_data_with_pca(combined_data_12_to_18)
+
+# Train the logistic regression model on sessions 12-18
+random_forest_model_12_to_18 <- suppressWarnings(train_combined_random_forest_with_pca(combined_data_12_to_18))
+
+# Print the results
+cat("Random Forest Model Accuracy (Lederberg):", random_forest_model_12_to_18$accuracy, "\n")
+cat("Random Forest Model Confusion Matrix (Lederberg):\n")
+print(random_forest_model_12_to_18$confusion_matrix)
+```
+- The random forest model again predicts with 100% accuracy, this time suggesting an issue with the test data being used to measure the effectiveness of the model.
+  
+</details>
+</details>
+</details>
+
+
+<details>
+  <summary style="font-size: 30px; font-weight: bold;">Section 5: Prediction Performance on the Test Sets</summary>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Prepping Test Data</summary>
+
+```{r echo=F}
+test_data=list()
+for(i in 1:2){
+  test_data[[i]]=readRDS(paste('./test/test',i,'.rds',sep=''))
+}
+
+# Apply feature engineering to each test session with PCA features
+test_features_with_pca <- lapply(test_data, add_pca_features)
+
+# Add session_id to each session's feature data
+for (i in 1:length(test_features_with_pca)) {
+  test_features_with_pca[[i]]$session_id <- i  # Assign session_id based on the index in the list
+}
+
+# Now normalize the test data using the same function
+test_features_normalized_with_pca <- lapply(test_features_with_pca, normalize_combined_data_with_pca)
+
+# Combine the normalized test data into a single data frame
+combined_test_data_with_pca <- do.call(rbind, test_features_normalized_with_pca)
+```
+  
+- The test data needs to be prepared in the same way that the training data was prepared for the model originally.
+
+</details>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Evaluating Model Performence</summary>
+
+```{r echo = F}
+# Function to evaluate model performance
+evaluate_performance <- function(predicted_classes, actual_classes) {
+  # Confusion Matrix
+  confusion_matrix <- table(Predicted = predicted_classes, Actual = actual_classes)
+  
+  # Accuracy
+  accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+  
+  # Precision
+  precision <- confusion_matrix[2, 2] / sum(confusion_matrix[, 2])
+  
+  # Recall
+  recall <- confusion_matrix[2, 2] / sum(confusion_matrix[2, ])
+  
+  # F1-Score
+  f1_score <- 2 * (precision * recall) / (precision + recall)
+  
+  # Return the results
+  return(list(
+    confusion_matrix = confusion_matrix,
+    accuracy = accuracy,
+    precision = precision,
+    recall = recall,
+    f1_score = f1_score
+  ))
+}
+
+combined_test_data_with_pca$session_id <- factor(combined_test_data_with_pca$session_id, 
+                                                 levels = levels(all_sessions_data_with_pca$session_id))
+
+# Make predictions on the test data with PCA features
+predictions_with_pca <- predict(combined_rf_results_with_pca$model, newdata = combined_test_data_with_pca, type = "response")
+
+# Convert probabilities to class labels (1 for success, 0 for failure)
+predicted_classes_with_pca <- ifelse(predictions_with_pca > 0.5, 1, 0)
+
+# Evaluate performance on the test data with PCA features
+performance_results_with_pca <- evaluate_performance(predicted_classes_with_pca, combined_test_data_with_pca$feedback_type)
+
+# Print the results
+cat("Test Data Performance with PCA Features:\n")
+cat("Confusion Matrix:\n")
+print(performance_results_with_pca$confusion_matrix)
+cat("Accuracy:", performance_results_with_pca$accuracy, "\n")
+cat("Precision:", performance_results_with_pca$precision, "\n")
+cat("Recall:", performance_results_with_pca$recall, "\n")
+cat("F1-Score:", performance_results_with_pca$f1_score, "\n")
+```
+  
+- Because of an imbalance in the amount of failures and successes the model is biased towards predicting successes
+  - The high precision and low recall reflects this, as it is good at predicting successes but struggles to predict failures
+- The F1-Score balances precision and recall, and as such is a good metric of how balanced the model is.
+
+</details>
+</details>
+
+
+<details>
+  <summary style="font-size: 30px; font-weight: bold;">Section 6: Discussion</summary>
+  
+  In this project, we analyzed neural activity in mice during a decision-making task, building predictive models to classify trial outcomes based on neural and task-related features. The final logistic regression model with PCA features achieved an accuracy of 73.04% on test data, with strong precision (86.46%) and recall (78.73%), though it struggled with failures due to dataset imbalance. A key insight was the importance of focusing on the time window when average spike counts were highest, which improved model performance by capturing critical neural engagement patterns. Lederberg, the best-performing mouse, showed improved success rates over time despite decreasing spike counts, highlighting the role of efficiency in learning. The logistic regression model was chosen for its interpretability and performance, demonstrating the potential of machine learning to predict behavioral outcomes from neural data. This work underscores the importance of integrating neural activity patterns, task conditions, and individual variability in understanding decision-making processes. 
+
+</details>
+
+<details>
+  <summary style="font-size: 20px; font-weight: bold;">Citations</summary>
+
+- https://pdf.ac/4v4gud 
+- https://pdf.ac/1XkISZ 
+- https://pdf.ac/2SY12T
+- https://pdf.ac/2JRNrX 
+- https://pdf.ac/3Ct0YB   
+- https://chatgpt.com/share/67d7c449-a5bc-8007-8cce-ba031e075cda
+
+</details>
+
+### Appendix
+
+```{r, ref.label=knitr::all_labels(), eval = F, echo = T}
+
+```
